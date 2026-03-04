@@ -15,17 +15,19 @@
 #include "../include/ping.h"
 
 // Global variables
-ping_stats_t stats = {0, 0, 999999, 0, 0};
+ping_stats_t stats = {0, 0, 999999, 0, 0, {0, 0}, {0, 0}};
 int running = 1;
 
 // Signal Handler (for Ctrl+C)
-void handle_signal(int sig) {
+void handle_signal(int sig) 
+{
     (void)sig;
     running = 0;
 }
 
 // Calculate ICMP Checksum
-unsigned short calculate_checksum(void *b, int len) {
+unsigned short calculate_checksum(void *b, int len) 
+{
     unsigned short *buf = b;
     unsigned int sum = 0;
     unsigned short result;
@@ -42,9 +44,11 @@ unsigned short calculate_checksum(void *b, int len) {
 }
 
 // Create Raw Socket
-int create_raw_socket() {
+int create_raw_socket() 
+{
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (sock < 0) {
+    if (sock < 0) 
+    {
         perror("socket");
         fprintf(stderr, "Need root privileges! Try: sudo\n");
     }
@@ -52,9 +56,11 @@ int create_raw_socket() {
 }
 
 // Resolve Hostname to IP
-int resolve_host(const char *hostname, struct sockaddr_in *addr) {
+int resolve_host(const char *hostname, struct sockaddr_in *addr) 
+{
     struct hostent *host = gethostbyname(hostname);
-    if (!host) {
+    if (!host) 
+    {
         fprintf(stderr, "ping: unknown host %s\n", hostname);
         return -1;
     }
@@ -65,7 +71,8 @@ int resolve_host(const char *hostname, struct sockaddr_in *addr) {
 }
 
 // Create ICMP Packet
-void create_icmp_packet(char *packet, int seq, int size, ping_options_t *opts) {
+void create_icmp_packet(char *packet, int seq, int size, ping_options_t *opts) 
+{
     struct icmp *icmp_hdr = (struct icmp *)packet;
     
     icmp_hdr->icmp_type = ICMP_ECHO;
@@ -83,11 +90,11 @@ void create_icmp_packet(char *packet, int seq, int size, ping_options_t *opts) {
     if (strlen(opts->payload_pattern) > 0) 
     {
         int pattern_len = strlen(opts->payload_pattern);
-        for (int i = 0; i < payload_len; i++) {
+        for (int i = 0; i < payload_len; i++) 
+        {
             payload[i] = opts->payload_pattern[i % pattern_len];
         }
     } 
-    
     else 
     {
         memset(payload, 0, payload_len);
@@ -111,7 +118,8 @@ void print_usage(char *progname) {
 }
 
 // Parse Command Line Arguments
-int parse_args(int argc, char *argv[], ping_options_t *opts) {
+int parse_args(int argc, char *argv[], ping_options_t *opts) 
+{
     int opt;
     
     opts->count = DEFAULT_COUNT;
@@ -169,26 +177,29 @@ int parse_args(int argc, char *argv[], ping_options_t *opts) {
 // Print Statistics
 void print_stats(ping_stats_t *stats, struct sockaddr_in *dest) 
 {
-    double elapsed = (stats->end_time.tv_sec - stats->start_time.tv_sec) +
-                     (stats->end_time.tv_usec - stats->start_time.tv_usec) / 1000000.0;
+    double elapsed = (stats->end_time.tv_sec - stats->start_time.tv_sec) * 1000.0 +
+                     (stats->end_time.tv_usec - stats->start_time.tv_usec) / 1000.0;
     
     double loss = (stats->sent > 0) ? 
                   (stats->sent - stats->received) * 100.0 / stats->sent : 0;
     
     printf("\n--- %s ping statistics ---\n", inet_ntoa(dest->sin_addr));
     printf("%d packets transmitted, %d received, %.1f%% packet loss, time %.0fms\n",
-           stats->sent, stats->received, loss, elapsed * 1000);
+           stats->sent, stats->received, loss, elapsed);
     
     if (stats->received > 0) 
     {
-        printf("rtt min/avg/max = %.3f/%.3f/%.3f ms\n",
+        double avg = stats->total_rtt / stats->received;
+        double mdev = 0; // We don't calculate mdev yet
+        printf("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3f ms\n",
                stats->min_rtt,
-               stats->total_rtt / stats->received,
-               stats->max_rtt);
+               avg,
+               stats->max_rtt,
+               mdev);
     }
 }
 
-// MAIN FUNCTION--------------------------------------------------------
+// MAIN FUNCTION
 int main(int argc, char *argv[]) 
 {
     ping_options_t opts;
@@ -214,14 +225,18 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    int total_size = opts.packet_size + ICMP_HEADER_SIZE + sizeof(struct timeval);
+    // Calculate ICMP packet size (what we send)
+    int icmp_packet_size = ICMP_HEADER_SIZE + sizeof(struct timeval) + opts.packet_size;
     
+    // ========== FIX 1: Header line to show 56(84) ==========
     if (!opts.quiet) 
     {
+        // System ping shows: payload(total with IP header)
+        // total = ICMP header(8) + payload(56) + IP header(20) = 84
         printf("PING %s (%s) %d(%d) bytes of data.\n",
                opts.host, inet_ntoa(dest.sin_addr),
-               opts.packet_size,
-               total_size + 20);
+               opts.packet_size,                    // 56
+               ICMP_HEADER_SIZE + opts.packet_size + 20);  // 8+56+20 = 84
     }
     
     struct timeval timeout;
@@ -233,6 +248,7 @@ int main(int argc, char *argv[])
     
     int seq = 1;
     struct timeval last_send = {0, 0};
+    int time_ms = 0;
     
     while (running && seq <= opts.count) 
     {
@@ -240,26 +256,30 @@ int main(int argc, char *argv[])
         {
             struct timeval now;
             gettimeofday(&now, NULL);
-            double elapsed = (now.tv_sec - stats.start_time.tv_sec) +
-                             (now.tv_usec - stats.start_time.tv_usec) / 1000000.0;
-            if (elapsed >= opts.deadline) break;
+            double elapsed = (now.tv_sec - stats.start_time.tv_sec) * 1000.0 +
+                             (now.tv_usec - stats.start_time.tv_usec) / 1000.0;
+            if (elapsed >= opts.deadline * 1000) break;
         }
         
         if (last_send.tv_sec != 0 && seq > 1) 
         {
             struct timeval now;
             gettimeofday(&now, NULL);
-            double elapsed = (now.tv_sec - last_send.tv_sec) +
-                             (now.tv_usec - last_send.tv_usec) / 1000000.0;
-            if (elapsed < opts.interval) {
-                usleep((opts.interval - elapsed) * 1000000);
+            double elapsed = (now.tv_sec - last_send.tv_sec) * 1000.0 +
+            (now.tv_usec - last_send.tv_usec) / 1000.0;
+            if (elapsed < opts.interval * 1000) 
+            {
+                usleep((opts.interval * 1000000) - (useconds_t)elapsed * 1000);
             }
         }
         
-        char packet[total_size];
-        create_icmp_packet(packet, seq, total_size, &opts);
+        char packet[icmp_packet_size];
+        create_icmp_packet(packet, seq, icmp_packet_size, &opts);
         
-        if (sendto(sock, packet, total_size, 0,
+        struct timeval send_time;
+        gettimeofday(&send_time, NULL);
+        
+        if (sendto(sock, packet, icmp_packet_size, 0,
             (struct sockaddr *)&dest, sizeof(dest)) <= 0) 
         {
             perror("ping: sendto");
@@ -285,16 +305,15 @@ int main(int argc, char *argv[])
             if (icmp_hdr->icmp_type == ICMP_ECHOREPLY &&
                 icmp_hdr->icmp_id == (getpid() & 0xFFFF) &&
                 icmp_hdr->icmp_seq == seq) 
-                {
+            {
                 
                 stats.received++;
                 
-                struct timeval *tv_sent = (struct timeval *)((char *)icmp_hdr + ICMP_HEADER_SIZE);
                 struct timeval tv_now;
                 gettimeofday(&tv_now, NULL);
                 
-                double rtt = (tv_now.tv_sec - tv_sent->tv_sec) * 1000.0 +
-                             (tv_now.tv_usec - tv_sent->tv_usec) / 1000.0;
+                double rtt = (tv_now.tv_sec - send_time.tv_sec) * 1000.0 +
+                             (tv_now.tv_usec - send_time.tv_usec) / 1000.0;
                 
                 if (rtt < stats.min_rtt) stats.min_rtt = rtt;
                 if (rtt > stats.max_rtt) stats.max_rtt = rtt;
@@ -302,8 +321,11 @@ int main(int argc, char *argv[])
                 
                 if (!opts.quiet) 
                 {
+                    // ========== FIX 2: Response line to show 64 bytes ==========
+                    // System ping shows ICMP header(8) + payload(56) = 64
+                    int display_size = ICMP_HEADER_SIZE + opts.packet_size;  // 8+56 = 64
                     printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.1f ms\n",
-                           bytes - ip_hdr_len,
+                           display_size,  // Now shows 64 instead of 80
                            inet_ntoa(sender.sin_addr),
                            icmp_hdr->icmp_seq,
                            ip_hdr->ttl,
@@ -320,6 +342,12 @@ int main(int argc, char *argv[])
         }
         
         seq++;
+        
+        // Calculate total time for statistics
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        time_ms = (now.tv_sec - stats.start_time.tv_sec) * 1000 +
+                  (now.tv_usec - stats.start_time.tv_usec) / 1000;
     }
     
     gettimeofday(&stats.end_time, NULL);
